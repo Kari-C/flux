@@ -186,7 +186,8 @@ $ python -m flux.api --prompt="A beautiful beach" image show
 ```
 
 # Local
-Note to self: use conda `torch` activate
-Use CUDA for GPU use on local
-Verify cuda is working with cuda_test.py
-![alt text](image.png)
+## Notes to self: 
+- use conda `torch` activate
+- For acceptable processing speed you must have CUDA for GPU processing on local
+- You can verify cuda is working with cuda_test.py
+#### ![Cuda test output](cuda_test.png)
