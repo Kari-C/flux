@@ -102,6 +102,7 @@ Options:
 
 To run the demo with the dev model and create a public link:
 
+
 ```bash
 python demo_gr.py --name flux-dev --share
 ```
@@ -183,3 +184,9 @@ $ python -m flux.api --prompt="A beautiful beach" save outputs/api
 # open the image directly
 $ python -m flux.api --prompt="A beautiful beach" image show
 ```
+
+# Local
+Note to self: use conda `torch` activate
+Use CUDA for GPU use on local
+Verify cuda is working with cuda_test.py
+![alt text](image.png)

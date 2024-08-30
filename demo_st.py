@@ -1,17 +1,21 @@
 import os
+from dotenv import load_dotenv
+load_dotenv()
+
 import re
 import time
 from glob import iglob
 from io import BytesIO
+from typing import Optional
 
 import streamlit as st
 import torch
 from einops import rearrange
 from fire import Fire
 from PIL import ExifTags, Image
-from st_keyup import st_keyup
 from torchvision import transforms
 from transformers import pipeline
+from huggingface_hub import login
 
 from flux.cli import SamplingOptions
 from flux.sampling import denoise, get_noise, get_schedule, prepare, unpack
@@ -24,20 +28,29 @@ from flux.util import (
     load_t5,
 )
 
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+login(token=os.environ.get("HUGGINGFACE_TOKEN"))
+
 NSFW_THRESHOLD = 0.85
+isImageGenerationInProgress = False;
 
-
-@st.cache_resource()
+@st.cache(allow_output_mutation=True)
 def get_models(name: str, device: torch.device, offload: bool, is_schnell: bool):
+    logger.info("Loading models...")
     t5 = load_t5(device, max_length=256 if is_schnell else 512)
     clip = load_clip(device)
     model = load_flow_model(name, device="cpu" if offload else device)
     ae = load_ae(name, device="cpu" if offload else device)
     nsfw_classifier = pipeline("image-classification", model="Falconsai/nsfw_image_detection")
+    logger.info("Models loaded successfully.")
     return model, ae, t5, clip, nsfw_classifier
 
-
-def get_image() -> torch.Tensor | None:
+def get_image() -> Optional[torch.Tensor]:
     image = st.file_uploader("Input", type=["jpg", "JPEG", "png"])
     if image is None:
         return None
@@ -52,13 +65,13 @@ def get_image() -> torch.Tensor | None:
     img: torch.Tensor = transform(image)
     return img[None, ...]
 
-
 @torch.inference_mode()
 def main(
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     offload: bool = False,
     output_dir: str = "output",
 ):
+    logger.info("Starting main function")
     torch_device = torch.device(device)
     names = list(configs.keys())
     name = st.selectbox("Which model to load?", names)
@@ -113,12 +126,17 @@ def main(
         seed = None
     save_samples = st.checkbox("Save samples?", not is_schnell)
     add_sampling_metadata = st.checkbox("Add sampling parameters to metadata?", True)
+    
+    if torch.cuda.is_available():
+        logger.info(torch.cuda.memory_summary())
+    else:
+        logger.info("CUDA is not available.")
 
     default_prompt = (
         "a photo of a forest with mist swirling around the tree trunks. The word "
-        '"FLUX" is painted over it in big, red brush strokes with visible texture'
+        '"KARI" is painted over it in big, red brush strokes with visible texture'
     )
-    prompt = st_keyup("Enter a prompt", value=default_prompt, debounce=300, key="interactive_text")
+    prompt = st.text_input("Enter a prompt", value=default_prompt)
 
     output_name = os.path.join(output_dir, "img_{idx}.jpg")
     if not os.path.exists(output_dir):
@@ -163,115 +181,120 @@ def main(
             opts.seed = st.session_state.seed
         elif opts.seed is None:
             opts.seed = rng.seed()
-        print(f"Generating '{opts.prompt}' with seed {opts.seed}")
+        logger.info(f"Generating '{opts.prompt}' with seed {opts.seed}")
+        isImageGenerationInProgress = True
         t0 = time.perf_counter()
 
-        if init_image is not None:
-            if resize_img:
-                init_image = torch.nn.functional.interpolate(init_image, (opts.height, opts.width))
-            else:
-                h, w = init_image.shape[-2:]
-                init_image = init_image[..., : 16 * (h // 16), : 16 * (w // 16)]
-                opts.height = init_image.shape[-2]
-                opts.width = init_image.shape[-1]
+        while isImageGenerationInProgress:
+            st.write('image generation in progress')
+            if init_image is not None:
+                if resize_img:
+                    init_image = torch.nn.functional.interpolate(init_image, (opts.height, opts.width))
+                else:
+                    h, w = init_image.shape[-2:]
+                    init_image = init_image[..., : 16 * (h // 16), : 16 * (w // 16)]
+                    opts.height = init_image.shape[-2]
+                    opts.width = init_image.shape[-1]
+                if offload:
+                    ae.encoder.to(torch_device)
+                init_image = ae.encode(init_image.to(torch_device))
+                if offload:
+                    ae = ae.cpu()
+                    torch.cuda.empty_cache()
+
+            # prepare input
+            x = get_noise(
+                1,
+                opts.height,
+                opts.width,
+                device=torch_device,
+                dtype=torch.bfloat16,
+                seed=opts.seed,
+            )
+            # divide pixel space by 16**2 to account for latent space conversion
+            timesteps = get_schedule(
+                opts.num_steps,
+                (x.shape[-1] * x.shape[-2]) // 4,
+                shift=(not is_schnell),
+            )
+            if init_image is not None:
+                t_idx = int((1 - image2image_strength) * num_steps)
+                t = timesteps[t_idx]
+                timesteps = timesteps[t_idx:]
+                x = t * x + (1.0 - t) * init_image.to(x.dtype)
+
             if offload:
-                ae.encoder.to(torch_device)
-            init_image = ae.encode(init_image.to(torch_device))
+                t5, clip = t5.to(torch_device), clip.to(torch_device)
+            inp = prepare(t5=t5, clip=clip, img=x, prompt=opts.prompt)
+
+            # offload TEs to CPU, load model to gpu
             if offload:
-                ae = ae.cpu()
+                t5, clip = t5.cpu(), clip.cpu()
+                torch.cuda.empty_cache()
+                model = model.to(torch_device)
+
+            # denoise initial noise
+            logger.info("Starting denoising...")
+            x = denoise(model, **inp, timesteps=timesteps, guidance=opts.guidance)
+            logger.info("Denoising completed.")
+
+            # offload model, load autoencoder to gpu
+            if offload:
+                model.cpu()
+                torch.cuda.empty_cache()
+                ae.decoder.to(x.device)
+
+            # decode latents to pixel space
+            x = unpack(x.float(), opts.height, opts.width)
+            with torch.autocast(device_type=torch_device.type, dtype=torch.bfloat16):
+                x = ae.decode(x)
+
+            if offload:
+                ae.decoder.cpu()
                 torch.cuda.empty_cache()
 
-        # prepare input
-        x = get_noise(
-            1,
-            opts.height,
-            opts.width,
-            device=torch_device,
-            dtype=torch.bfloat16,
-            seed=opts.seed,
-        )
-        # divide pixel space by 16**2 to acocunt for latent space conversion
-        timesteps = get_schedule(
-            opts.num_steps,
-            (x.shape[-1] * x.shape[-2]) // 4,
-            shift=(not is_schnell),
-        )
-        if init_image is not None:
-            t_idx = int((1 - image2image_strength) * num_steps)
-            t = timesteps[t_idx]
-            timesteps = timesteps[t_idx:]
-            x = t * x + (1.0 - t) * init_image.to(x.dtype)
+            t1 = time.perf_counter()
 
-        if offload:
-            t5, clip = t5.to(torch_device), clip.to(torch_device)
-        inp = prepare(t5=t5, clip=clip, img=x, prompt=opts.prompt)
+            fn = output_name.format(idx=idx)
+            logger.info(f"Done in {t1 - t0:.1f}s.")
+            # bring into PIL format and save
+            x = x.clamp(-1, 1)
+            x = embed_watermark(x.float())
+            x = rearrange(x[0], "c h w -> h w c")
 
-        # offload TEs to CPU, load model to gpu
-        if offload:
-            t5, clip = t5.cpu(), clip.cpu()
-            torch.cuda.empty_cache()
-            model = model.to(torch_device)
+            img = Image.fromarray((127.5 * (x + 1.0)).cpu().byte().numpy())
+            nsfw_score = [x["score"] for x in nsfw_classifier(img) if x["label"] == "nsfw"][0]
 
-        # denoise initial noise
-        x = denoise(model, **inp, timesteps=timesteps, guidance=opts.guidance)
+            if nsfw_score < NSFW_THRESHOLD:
+                buffer = BytesIO()
+                exif_data = Image.Exif()
+                if init_image is None:
+                    exif_data[ExifTags.Base.Software] = "AI generated;txt2img;flux"
+                else:
+                    exif_data[ExifTags.Base.Software] = "AI generated;img2img;flux"
+                exif_data[ExifTags.Base.Make] = "Black Forest Labs"
+                exif_data[ExifTags.Base.Model] = name
+                if add_sampling_metadata:
+                    exif_data[ExifTags.Base.ImageDescription] = prompt
+                img.save(buffer, format="jpeg", exif=exif_data, quality=95, subsampling=0)
 
-        # offload model, load autoencoder to gpu
-        if offload:
-            model.cpu()
-            torch.cuda.empty_cache()
-            ae.decoder.to(x.device)
+                img_bytes = buffer.getvalue()
+                if save_samples:
+                    logger.info(f"Saving {fn}")
+                    with open(fn, "wb") as file:
+                        file.write(img_bytes)
+                    idx += 1
 
-        # decode latents to pixel space
-        x = unpack(x.float(), opts.height, opts.width)
-        with torch.autocast(device_type=torch_device.type, dtype=torch.bfloat16):
-            x = ae.decode(x)
-
-        if offload:
-            ae.decoder.cpu()
-            torch.cuda.empty_cache()
-
-        t1 = time.perf_counter()
-
-        fn = output_name.format(idx=idx)
-        print(f"Done in {t1 - t0:.1f}s.")
-        # bring into PIL format and save
-        x = x.clamp(-1, 1)
-        x = embed_watermark(x.float())
-        x = rearrange(x[0], "c h w -> h w c")
-
-        img = Image.fromarray((127.5 * (x + 1.0)).cpu().byte().numpy())
-        nsfw_score = [x["score"] for x in nsfw_classifier(img) if x["label"] == "nsfw"][0]
-
-        if nsfw_score < NSFW_THRESHOLD:
-            buffer = BytesIO()
-            exif_data = Image.Exif()
-            if init_image is None:
-                exif_data[ExifTags.Base.Software] = "AI generated;txt2img;flux"
+                st.session_state["samples"] = {
+                    "prompt": opts.prompt,
+                    "img": img,
+                    "seed": opts.seed,
+                    "bytes": img_bytes,
+                }
+                opts.seed = None
             else:
-                exif_data[ExifTags.Base.Software] = "AI generated;img2img;flux"
-            exif_data[ExifTags.Base.Make] = "Black Forest Labs"
-            exif_data[ExifTags.Base.Model] = name
-            if add_sampling_metadata:
-                exif_data[ExifTags.Base.ImageDescription] = prompt
-            img.save(buffer, format="jpeg", exif=exif_data, quality=95, subsampling=0)
-
-            img_bytes = buffer.getvalue()
-            if save_samples:
-                print(f"Saving {fn}")
-                with open(fn, "wb") as file:
-                    file.write(img_bytes)
-                idx += 1
-
-            st.session_state["samples"] = {
-                "prompt": opts.prompt,
-                "img": img,
-                "seed": opts.seed,
-                "bytes": img_bytes,
-            }
-            opts.seed = None
-        else:
-            st.warning("Your generated image may contain NSFW content.")
-            st.session_state["samples"] = None
+                st.warning("Your generated image may contain NSFW content.")
+                st.session_state["samples"] = None
 
     samples = st.session_state.get("samples", None)
     if samples is not None:
@@ -283,11 +306,10 @@ def main(
             mime="image/jpg",
         )
         st.write(f"Seed: {samples['seed']}")
-
+        isImageGenerationInProcess = False;
 
 def app():
     Fire(main)
-
 
 if __name__ == "__main__":
     app()
